@@ -22,8 +22,26 @@ except ImportError:
     print("❌ Error: Faltan librerías de visión. Ejecuta: pip install pytesseract pillow")
     sys.exit(1)
 
-# Configuración de Tesseract para Windows (Descomentar y ajustar si no está en PATH)
-# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+# Auto-configuración de Tesseract (Multi-plataforma)
+import platform
+
+if platform.system() == "Windows":
+    tesseract_paths = [
+        r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+        r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+    ]
+    for path in tesseract_paths:
+        if os.path.exists(path):
+            pytesseract.pytesseract.tesseract_cmd = path
+            break
+    else:
+        print("⚠️ ADVERTENCIA: Tesseract no encontrado.")
+        print("   Descarga desde: https://github.com/UB-Mannheim/tesseract/wiki")
+        print("   El OCR no funcionará sin Tesseract.")
+
+else:
+    print("✅ Tesseract encontrado en: ", pytesseract.pytesseract.tesseract_cmd)
+    print("   OCR funcionará correctamente.")
 
 # --- FIX DE RUTAS ---
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -226,11 +244,8 @@ def procesar_contenido_profundo(ruta_pdf, meta_analisis):
                 md_page = pymupdf4llm.to_markdown(ruta_pdf, pages=[i])
                 
                 # 2. Obtener Texto de Imágenes (OCR V8)
-                # Solo ejecutamos OCR si la página no es la portada (pag 1) para ahorrar tiempo
-                texto_ocr = ""
-                if i > 0: 
-                    texto_ocr = procesar_ocr_pagina(doc, i)
-                
+                texto_ocr = procesar_ocr_pagina(doc, i)
+
                 # 3. Fusión
                 contenido_completo = md_page + "\n" + texto_ocr
             except Exception as e:
@@ -321,18 +336,20 @@ def ingest_v8():
     # 4. Procesamiento
     print(">> 🧠 Cargando modelo de Embeddings (puede tardar)...")
     embeddings = HuggingFaceEmbeddings(model_name=MODEL_NAME)
-    
+    total_vigentes = sum(1 for m in mapa_versiones.values() if m['es_mas_reciente'])
+    vigente_actual = 0
     for ruta in archivos_pdf:
         meta = mapa_versiones[ruta]
         # Solo procesamos los vigentes para ahorrar tiempo de OCR
         if not meta['es_mas_reciente']:
-            print(f"   ⏭️  Saltando obsoleto: {meta['nombre_archivo']}")
+            print(f"   ⏭  Saltando obsoleto: {meta['nombre_archivo']}")
             # Aún así guardamos la ficha para saber que existe
             ficha = extraer_ficha_tecnica(ruta, meta)
             if ficha: docs_biblio.append(ficha)
             continue
+        vigente_actual += 1
+        print(f"    [{vigente_actual}/{total_vigentes}] Ingestando: {meta['nombre_archivo']}")
 
-        print(f"   👁️  Ingestando con Visión: {meta['nombre_archivo']}")
         
         # A. Ficha Biblioteca
         ficha = extraer_ficha_tecnica(ruta, meta)
