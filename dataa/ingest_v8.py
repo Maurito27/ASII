@@ -1,18 +1,29 @@
 """
-Ingesta V7.0 - Embeddings Enterprise & Semantic Chunking
---------------------------------------------------------
-Mejoras sobre V6:
-1. Modelo: intfloat/multilingual-e5-large (1024 dim, experto en español).
-2. Chunking: Ventanas más grandes (1500 chars) para capturar procedimientos completos.
-3. Separadores: Prioriza cortes lógicos (\\n\\n) sobre arbitrarios.
-4. Batching: Guarda en lotes pequeños para feedback visual constante.
+Ingesta V8.0 - Vision & Selective OCR (Offline)
+-----------------------------------------------
+Mejoras sobre V7:
+1. OCR Selectivo: Detecta imágenes en el PDF, las filtra por tamaño y extrae texto.
+2. Enriquecimiento: Inyecta el texto extraído de diagramas/capturas en el chunk correspondiente.
+3. Dependencias: Requiere 'pytesseract' y 'Pillow'.
 """
 import os
 import sys
 import shutil
 import re
 import hashlib
+import io
 from datetime import datetime
+
+# --- IMPORTACIONES DE VISIÓN ---
+try:
+    import pytesseract
+    from PIL import Image
+except ImportError:
+    print("❌ Error: Faltan librerías de visión. Ejecuta: pip install pytesseract pillow")
+    sys.exit(1)
+
+# Configuración de Tesseract para Windows (Descomentar y ajustar si no está en PATH)
+# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
 # --- FIX DE RUTAS ---
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -22,7 +33,7 @@ if parent_dir not in sys.path:
 # --------------------
 
 import pymupdf4llm 
-import fitz 
+import fitz  # PyMuPDF
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
@@ -30,7 +41,6 @@ from langchain_core.documents import Document
 from app.core.config import Configuracion
 
 # --- CONFIGURACIÓN DE MODELO ---
-# Usamos E5-Large. Requiere aprox 1-2GB de RAM solo para cargar el modelo.
 MODEL_NAME = "intfloat/multilingual-e5-large" 
 
 # Rutas
@@ -94,12 +104,9 @@ def analizar_versiones(lista_archivos):
     
     mapa_final = {}
     for familia, docs in familias.items():
-        # Ordenar por Año DESC, luego Versión DESC
         docs.sort(key=lambda x: (x['anio'], x['version_num']), reverse=True)
         ganador = docs[0]
-        
         print(f"   🏆 Familia '{familia}': Ganador -> {ganador['nombre']} (v{ganador['version_str']})")
-        
         for d in docs:
             mapa_final[d['ruta']] = {
                 "doc_id": d['doc_id'],
@@ -112,7 +119,51 @@ def analizar_versiones(lista_archivos):
                 
     return mapa_final
 
-# --- PROCESAMIENTO ---
+# --- PROCESAMIENTO CON VISIÓN (OCR) ---
+
+def procesar_ocr_pagina(doc_fitz, numero_pagina):
+    """
+    Extrae imágenes de una página, filtra las pequeñas y aplica OCR.
+    Retorna el texto encontrado en las imágenes.
+    """
+    texto_visual = ""
+    try:
+        page = doc_fitz[numero_pagina]
+        image_list = page.get_images(full=True)
+        
+        if not image_list:
+            return ""
+
+        for img_index, img in enumerate(image_list):
+            xref = img[0]
+            base_image = doc_fitz.extract_image(xref)
+            image_bytes = base_image["image"]
+            
+            # Filtro 1: Tamaño de archivo (Ignorar iconos < 5KB)
+            if len(image_bytes) < 5120: 
+                continue
+                
+            try:
+                image = Image.open(io.BytesIO(image_bytes))
+                
+                # Filtro 2: Dimensiones (Ignorar líneas o separadores pequeños)
+                width, height = image.size
+                if width < 100 or height < 100:
+                    continue
+                
+                # OCR (Español)
+                text = pytesseract.image_to_string(image, lang='spa')
+                
+                if len(text.strip()) > 15: # Solo si encontró algo sustancial
+                    texto_visual += f"\n[CONTENIDO VISUAL DETECTADO (Img {img_index+1})]:\n{text.strip()}\n"
+                    
+            except Exception:
+                continue # Si falla una imagen, seguimos con la siguiente
+
+    except Exception as e:
+        print(f"    ⚠️ Error OCR en pág {numero_pagina+1}: {e}")
+        
+    return texto_visual
 
 def extraer_ficha_tecnica(ruta_pdf, meta_analisis):
     """Genera la ficha para el Bibliotecario (Chroma Library)."""
@@ -128,7 +179,6 @@ def extraer_ficha_tecnica(ruta_pdf, meta_analisis):
 
         estado_ver = "✅ VIGENTE" if meta_analisis['es_mas_reciente'] else "⚠️ OBSOLETO"
         
-        # Enriquecemos la ficha para que el embedding E5 capture mejor el contexto semántico
         contenido_ficha = (
             f"DOCUMENTO TÉCNICO SOFTLAND ERP\n"
             f"TÍTULO: {meta_analisis['nombre_archivo']}\n"
@@ -154,32 +204,43 @@ def extraer_ficha_tecnica(ruta_pdf, meta_analisis):
         return None
 
 def procesar_contenido_profundo(ruta_pdf, meta_analisis):
-    """Genera chunks estructurados para el Lector."""
+    """Genera chunks estructurados + OCR de imágenes."""
     chunks_finales = []
     
     try:
-        doc = fitz.open(ruta_pdf)
+        doc = fitz.open(ruta_pdf) # Abrimos con PyMuPDF para OCR
         
         headers_to_split_on = [("#", "h1"), ("##", "h2"), ("###", "h3")]
         markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
         
-        # MEJORA V7: Chunking Semántico más grande
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1500, 
             chunk_overlap=300,
             separators=["\n\n", "\n", ". ", " ", ""]
         )
 
-        for i, page in enumerate(doc):
+        for i in range(len(doc)):
             num_pagina = i + 1
             try:
+                # 1. Obtener Texto Markdown (pymupdf4llm)
                 md_page = pymupdf4llm.to_markdown(ruta_pdf, pages=[i])
-            except:
+                
+                # 2. Obtener Texto de Imágenes (OCR V8)
+                # Solo ejecutamos OCR si la página no es la portada (pag 1) para ahorrar tiempo
+                texto_ocr = ""
+                if i > 0: 
+                    texto_ocr = procesar_ocr_pagina(doc, i)
+                
+                # 3. Fusión
+                contenido_completo = md_page + "\n" + texto_ocr
+            except Exception as e:
+                print(f"    - Error leyendo pág {num_pagina}: {e}")
                 continue
             
-            if not md_page.strip(): continue
+            if not contenido_completo.strip(): continue
 
-            header_splits = markdown_splitter.split_text(md_page)
+            # 4. Splitting
+            header_splits = markdown_splitter.split_text(contenido_completo)
             page_chunks = text_splitter.split_documents(header_splits)
             
             for chunk in page_chunks:
@@ -188,7 +249,6 @@ def procesar_contenido_profundo(ruta_pdf, meta_analisis):
                 
                 if len(chunk.page_content.strip()) < 50: continue
 
-                # Inyección de contexto en el contenido del chunk
                 contenido_enriquecido = f"MANUAL: {meta_analisis['nombre_archivo']}\nSECCIÓN: {h1} > {h2}\n\n{chunk.page_content}"
                 chunk.page_content = contenido_enriquecido
 
@@ -202,7 +262,8 @@ def procesar_contenido_profundo(ruta_pdf, meta_analisis):
                     "h2": h2,
                     "nivel_profundidad": 2 if h2 else 1,
                     "es_mas_reciente": meta_analisis['es_mas_reciente'],
-                    "anio": meta_analisis['anio']
+                    "anio": meta_analisis['anio'],
+                    "tiene_ocr": bool(texto_ocr) # Flag útil para saber si hay diagramas
                 })
                 chunks_finales.append(chunk)
                 
@@ -214,30 +275,23 @@ def procesar_contenido_profundo(ruta_pdf, meta_analisis):
         return []
 
 def guardar_en_chroma_con_progreso(docs, embeddings, directorio, etiqueta="Docs"):
-    """
-    Guarda documentos en lotes pequeños para mostrar progreso en consola.
-    Evita la sensación de 'congelamiento' con modelos pesados.
-    """
+    """Guarda documentos en lotes pequeños."""
     if not docs: return
     print(f">> Iniciando indexación de {len(docs)} {etiqueta} en {directorio}...")
     
-    # Instanciamos la DB una vez
     db = Chroma(embedding_function=embeddings, persist_directory=directorio)
-    
-    # Tamaño del lote (50 es seguro para CPU/Memoria)
     BATCH_SIZE = 50
     total = len(docs)
     
     for i in range(0, total, BATCH_SIZE):
         lote = docs[i : i + BATCH_SIZE]
         db.add_documents(lote)
-        
-        # Feedback visual
         progreso = min(i + BATCH_SIZE, total)
         print(f"   [{etiqueta}] Guardando {progreso}/{total} ({(progreso/total)*100:.1f}%)")
 
-def ingest_v7():
-    print(f"--- INICIANDO INGESTA V7.0 (MODELO: {MODEL_NAME}) ---")
+def ingest_v8():
+    print(f"--- INICIANDO INGESTA V8.0 (VISION & OCR) ---")
+    print(f"--- Modelo: {MODEL_NAME} ---")
     
     # 1. Limpieza
     if os.path.exists(DB_LIBRARY): shutil.rmtree(DB_LIBRARY)
@@ -270,24 +324,32 @@ def ingest_v7():
     
     for ruta in archivos_pdf:
         meta = mapa_versiones[ruta]
-        print(f"   ⚙️  Ingestando: {meta['nombre_archivo']}")
+        # Solo procesamos los vigentes para ahorrar tiempo de OCR
+        if not meta['es_mas_reciente']:
+            print(f"   ⏭️  Saltando obsoleto: {meta['nombre_archivo']}")
+            # Aún así guardamos la ficha para saber que existe
+            ficha = extraer_ficha_tecnica(ruta, meta)
+            if ficha: docs_biblio.append(ficha)
+            continue
+
+        print(f"   👁️  Ingestando con Visión: {meta['nombre_archivo']}")
         
         # A. Ficha Biblioteca
         ficha = extraer_ficha_tecnica(ruta, meta)
         if ficha: docs_biblio.append(ficha)
         
-        # B. Contenido Profundo
+        # B. Contenido Profundo + OCR
         chunks = procesar_contenido_profundo(ruta, meta)
         docs_cont.extend(chunks)
 
     # 5. Guardado por Lotes
     if docs_biblio:
         guardar_en_chroma_con_progreso(docs_biblio, embeddings, DB_LIBRARY, "Fichas")
-        guardar_en_chroma_con_progreso(docs_cont, embeddings, DB_CONTENT, "Fragmentos")
+        guardar_en_chroma_con_progreso(docs_cont, embeddings, DB_CONTENT, "Fragmentos (Texto+OCR)")
         
-        print("✅ INGESTA V7 COMPLETADA. (Base de datos optimizada)")
+        print("✅ INGESTA V8 COMPLETADA. Base de conocimiento multimodal lista.")
     else:
         print("❌ Error crítico: No se generaron documentos.")
 
 if __name__ == "__main__":
-    ingest_v7()
+    ingest_v8()
