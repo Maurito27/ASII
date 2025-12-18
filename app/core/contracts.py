@@ -1,23 +1,25 @@
 """
-Contratos de Datos - ASII V6 Enterprise (contracts.py)
+Contratos de Datos - ASII V8 Enterprise (contracts.py)
 ------------------------------------------------------
-Define la estructura estricta de los metadatos y constantes del sistema.
-Cumple con el DET V6.0 para asegurar consistencia entre Ingesta, RAG y Cerebro.
+Actualizado para Cross-Encoder (Logits) y Embeddings E5.
 """
 
 from typing import TypedDict, Literal, Optional
 
 # --- CONSTANTES DE NEGOCIO ---
 
-# Umbrales de Confianza (Scoring L2 de Chroma)
-# Menor distancia = Mayor similitud
+# UMBRALES PARA CROSS-ENCODER (Logits de MS-MARCO)
+# > 3.0: Certeza casi absoluta
+# > 1.0: Relevancia alta
+# > -1.0: Relevancia posible/media
+# < -1.0: Irrelevante / Ruido
 SCORE_THRESHOLD = {
-    "AUTO_SELECT": 0.55, # Seremos más estrictos al principio
-    "CONFIRM": 0.85,     
-    "DISCARD": 1.0       
+    "HIGH_CONFIDENCE": 2.5,  # Auto-selección
+    "MEDIUM_CONFIDENCE": -1.0, # Confirmar con usuario
+    "MIN_RELEVANCE": -4.0    # Descarte absoluto
 }
 
-# --- ESQUEMAS DE METADATOS (Tipado estático para referencia) ---
+# --- ESQUEMAS DE METADATOS ---
 
 class LibraryMetadata(TypedDict):
     doc_id: str
@@ -28,7 +30,7 @@ class LibraryMetadata(TypedDict):
     es_mas_reciente: bool
     tipo: Literal["ficha_biblioteca"]
     resumen: str
-    
+
 class ContentMetadata(TypedDict):
     doc_id: str
     nombre_archivo: str
@@ -38,6 +40,6 @@ class ContentMetadata(TypedDict):
     nivel_profundidad: int
     pagina_inicio: int
     origen: Literal["contenido_profundo"]
-    # Agregamos campo para debugging de relevancia
-    es_mas_reciente: bool 
+    es_mas_reciente: bool
     anio: int
+    tiene_ocr: bool
